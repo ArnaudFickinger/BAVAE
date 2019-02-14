@@ -45,7 +45,7 @@ class GenerativeDiscriminatorLoss(torch.nn.Module):
         super(GenerativeDiscriminatorLoss, self).__init__()
 
     def forward(self, real, fake):
-        loss_fake = 1-fake
+        loss_fake = 1 - fake
         loss_real = -torch.exp(-real)
         return -(loss_fake+loss_real)
 
