@@ -7,22 +7,20 @@ from torch import nn, optim
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
-from avae import FaceVAE
+from bavae import BAVAE
 import h5py
 import scipy as sp
 import os
 import pdb
 import logging
 import pylab as pl
-from utils import smartSum, smartAppendDict, smartAppend, export_scripts
-from callbacks import callback_avae
+from utils import export_scripts
 from data_parser import read_face_data, FaceDataset
 from optparse import OptionParser
 import logging
 import pickle
 import time
 import numpy as np
-
 
 parser = OptionParser()
 parser.add_option(
@@ -59,7 +57,6 @@ parser.add_option("--debug", action="store_true", dest="debug", default=False)
 (opt, args) = parser.parse_args()
 opt_dict = vars(opt)
 
-
 if not os.path.exists(opt.outdir):
     os.makedirs(opt.outdir)
 
@@ -95,20 +92,19 @@ pickle.dump(vae_cfg, open(os.path.join(opt.outdir, "vae.cfg.p"), "wb"))
 
 
 def main():
-
     torch.manual_seed(opt.seed)
 
     if opt.debug:
         pdb.set_trace()
 
     # define VAE and optimizer
-    vae = FaceVAE(**vae_cfg).to(device)
-    bce = nn.BCELoss(reduction='sum').to(device)
+    vae = BAVAE(**vae_cfg).to(device)
 
     # optimizer
     optimizer_Enc = optim.Adam(vae.encode.parameters(), lr=0.0003)
     optimizer_Dec = optim.Adam(vae.decode.parameters(), lr=0.0003)
-    optimizer_Dis = optim.Adam(vae.discrim.parameters(), lr=0.00003)
+    optimizer_GDis = optim.Adam(vae.discrim.parameters(), lr=0.00003)
+    optimizer_IDis = optim.Adam(vae.discrim.parameters(), lr=0.00003)
 
     # load data
     img, obj, view = read_face_data(opt.data)  # image, object, and view
@@ -117,116 +113,58 @@ def main():
     train_queue = DataLoader(train_data, batch_size=opt.bs, shuffle=True)
     val_queue = DataLoader(val_data, batch_size=opt.bs, shuffle=False)
 
-    history = {}
     for epoch in range(opt.epochs):
-
-        # train and eval
-        ht = train_ep(vae, bce, train_queue, optimizer_Enc ,optimizer_Dec ,optimizer_Dis, gamma=1)
-        hv = eval_ep(vae, bce, val_queue, gamma = 1)
-        smartAppendDict(history, ht)
-        smartAppendDict(history, hv)
-        logging.info(
-            "epoch %d - train_mse: %f- train_abs: %f- train_kld: %f - train_loss_enc: %f- train_loss_dec: %f- train_loss_dis: %f - test_mse %f - test_abs %f - test_kld %f - test_loss_enc %f- test_loss_dec %f- test_loss_dis %f" % (epoch, ht["mse"], ht["abs"], ht["kld"], ht["loss_enc"], ht["loss_dec"], ht["loss_dis"],  hv["mse_val"], hv["abs_val"], hv["kld_val"], hv["loss_enc_val"],hv["loss_dec_val"],hv["loss_dis_val"])
-        )
-        
-
-        # callbacks
-        if epoch % opt.epoch_cb == 0:
-            logging.info("epoch %d - executing callback" % epoch)
-            wfile = os.path.join(wdir, "weights.%.5d.pt" % epoch)
-            ffile = os.path.join(fdir, "plot.%.5d.png" % epoch)
-            torch.save(vae.state_dict(), wfile)
-            callback_avae(epoch, val_queue, vae, history, ffile, device)
+        train_ep(vae, train_queue, optimizer_Enc, optimizer_Dec, optimizer_GDis, optimizer_IDis, gamma=1)
+        eval_ep(vae, val_queue, gamma=1)
 
 
-def train_ep(vae, bce, train_queue, optimizer_Enc ,optimizer_Dec ,optimizer_Dis, gamma=1):
-
-    rv = {}
+def train_ep(vae, train_queue, optimizer_Enc, optimizer_Dec, optimizer_GDis, optimizer_IDis, gamma=1):
     vae.train()
 
     for batch_i, data in enumerate(train_queue):
-        
         batch_size = len(data[0])
-
-        ones_label = Variable(torch.ones(batch_size)).to(device)
-        zeros_label = Variable(torch.zeros(batch_size)).to(device)
 
         # forward
         y = data[0]
         eps = Variable(torch.randn(y.shape[0], 256), requires_grad=False)
         y, eps = y.to(device), eps.to(device)
-        kld, abs, dreal, dfake, mse = vae.forward(y, eps)
+        idloss, gdloss = vae.forward(y, eps)
 
-        real_loss = bce(dreal, ones_label)
-        fake_loss = bce(dfake, zeros_label)
+        enc_loss = - idloss
+        dec_loss = - gdloss
 
-        gen_loss = bce(dfake, ones_label)
+        optimizer_IDis.zero_grad()
+        idloss.backward(retain_graph=True)
+        optimizer_IDis.step()
 
-        loss_dis = real_loss + fake_loss
-        loss_dec = gamma * abs.sum() + gen_loss
-        loss_enc = (kld+abs).sum()
-
-        optimizer_Dis.zero_grad()
-        loss_dis.backward(retain_graph=True)
-        optimizer_Dis.step()
+        optimizer_GDis.zero_grad()
+        gdloss.backward(retain_graph=True)
+        optimizer_GDis.step()
 
         optimizer_Dec.zero_grad()
-        loss_dec.backward(retain_graph=True)
+        dec_loss.backward(retain_graph=True)
         optimizer_Dec.step()
 
         optimizer_Enc.zero_grad()
-        loss_enc.backward()
+        enc_loss.backward()
         optimizer_Enc.step()
 
-        # sum metrics
-        _n = train_queue.dataset.Y.shape[0]
-        smartSum(rv, "mse", float(mse.data.sum().cpu()) / float(_n))
-        smartSum(rv, "abs", float(abs.data.sum().cpu()) / float(_n))
-        smartSum(rv, "kld", float(kld.data.sum().cpu()) / float(_n))
-        smartSum(rv, "loss_dis", float(loss_dis.data.cpu()) / float(_n))
-        smartSum(rv, "loss_dec", float(loss_dec.data.cpu()) / float(_n))
-        smartSum(rv, "loss_enc", float(loss_enc.data.cpu()) / float(_n))
 
-    return rv
-
-
-def eval_ep(vae, bce, val_queue, gamma):
-    rv = {}
+def eval_ep(vae, val_queue, gamma):
     vae.eval()
 
     with torch.no_grad():
-
         for batch_i, data in enumerate(val_queue):
             batch_size = len(data[0])
 
             # forward
             y = data[0]
             eps = Variable(torch.randn(y.shape[0], 256), requires_grad=False)
-            ones_label = Variable(torch.ones(batch_size)).to(device)
-            zeros_label = Variable(torch.zeros(batch_size)).to(device)
-
             y, eps = y.to(device), eps.to(device)
-            kld, abs, dreal, dfake, mse = vae.forward(y, eps)
+            idloss, gdloss = vae.forward(y, eps)
 
-            real_loss = bce(dreal, ones_label)
-            fake_loss = bce(dfake, zeros_label)
-            
-            gen_loss = bce(dfake, ones_label)
-
-            loss_dis = real_loss + fake_loss
-            loss_dec = gamma * abs.sum() + gen_loss
-            loss_enc = (kld + abs).sum()
-
-            # sum metrics
-            _n = val_queue.dataset.Y.shape[0]
-            smartSum(rv, "mse_val", float(mse.data.sum().cpu()) / float(_n))
-            smartSum(rv, "abs_val", float(abs.data.sum().cpu()) / float(_n))
-            smartSum(rv, "kld_val", float(kld.data.sum().cpu()) / float(_n))
-            smartSum(rv, "loss_dis_val", float(loss_dis.data.cpu()) / float(_n))
-            smartSum(rv, "loss_dec_val", float(loss_dec.data.cpu()) / float(_n))
-            smartSum(rv, "loss_enc_val", float(loss_enc.data.cpu()) / float(_n))
-
-    return rv
+            enc_loss = - idloss
+            dec_loss = - gdloss
 
 
 if __name__ == "__main__":

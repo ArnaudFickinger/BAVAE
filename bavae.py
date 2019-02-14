@@ -20,6 +20,64 @@ def f_act(x, act="elu"):
         return None
 
 
+class GenerativeDiscriminator(nn.Module):
+    def __init__(self, img_size=128, nf=32, zdim=256, steps=5, colors=3, act="elu", vy=1e-3, gamma = 0, ks=3):
+        super(GenerativeDiscriminator, self).__init__()
+        # conv cells discriminator
+        self.disconv = nn.ModuleList()
+        cell = Conv2dCellDown(colors, nf, ks, act)
+        self.disconv += [cell]
+        for i in range(steps - 1):
+            cell = Conv2dCellDown(nf, nf, ks, act)
+            self.disconv += [cell]
+        cell = nn.Conv2d(nf, 1, 4)
+        self.disconv += [cell]
+
+    def forward(self, x):
+        for cell in self.disconv:
+            x = cell(x)
+        return x
+
+
+class GenerativeDiscriminatorLoss(torch.nn.Module):
+
+    def __init__(self):
+        super(GenerativeDiscriminatorLoss, self).__init__()
+
+    def forward(self, real, fake):
+        loss_fake = 1-fake
+        loss_real = -torch.exp(-real)
+        return -(loss_fake+loss_real)
+
+
+class InferenceDiscriminator(nn.Module):
+    def __init__(self, img_size=128, nf=32, zdim=256, steps=5, colors=3, act="elu", vy=1e-3, gamma = 0, ks=3):
+        super(InferenceDiscriminator, self).__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(zdim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, z):
+        validity = self.model(z)
+        return validity
+
+
+class InferenceDiscriminatorLoss(torch.nn.Module):
+
+    def __init__(self):
+        super(InferenceDiscriminatorLoss, self).__init__()
+
+    def forward(self, real, fake):
+        loss_fake = -torch.exp(fake-1)
+        loss_real = real
+        return -(loss_fake+loss_real)
+
+
 class Conv2dCellDown(nn.Module):
     def __init__(self, ni, no, ks=3, act="elu"):
         super(Conv2dCellDown, self).__init__()
@@ -99,33 +157,12 @@ class Decoder(nn.Module):
         return x
 
 
-class Discriminator(nn.Module):
-    def __init__(self, img_size=128, nf=32, zdim=256, steps=5, colors=3, act="elu", vy=1e-3, gamma = 0, ks=3):
-        super(Discriminator, self).__init__()
-        # conv cells discriminator
-        self.disconv = nn.ModuleList()
-        cell = Conv2dCellDown(colors, nf, ks, act)
-        self.disconv += [cell]
-        for i in range(steps - 1):
-            cell = Conv2dCellDown(nf, nf, ks, act)
-            self.disconv += [cell]
-        cell = nn.Conv2d(nf, 1, 4)
-        self.disconv += [cell]
-        cell = nn.Sigmoid()
-        self.disconv += [cell]
-
-    def forward(self, x):
-        for cell in self.disconv:
-            x = cell(x)
-        return x
-
-
-class FaceVAE(nn.Module):
+class BAVAE(nn.Module):
     def __init__(
         self, img_size=128, nf=32, zdim=256, steps=5, colors=3, act="elu", vy=1e-3, gamma = 0
     ):
 
-        super(FaceVAE, self).__init__()
+        super(BAVAE, self).__init__()
 
         # store useful stuff
         self.red_img_size = img_size // (2 ** steps)
@@ -133,6 +170,7 @@ class FaceVAE(nn.Module):
         self.gamma = gamma
         self.size_flat = self.red_img_size ** 2 * nf
         self.K = img_size ** 2 * colors
+        self.zdim = zdim
         ks = 3
 
         # define variance
@@ -145,31 +183,29 @@ class FaceVAE(nn.Module):
 
         self.encode = Encoder()
         self.decode = Decoder()
-        self.discrim =  Discriminator()
+        self.gdiscrim =  GenerativeDiscriminator()
+        self.idiscrim = InferenceDiscriminator()
+        self.gdiscrimloss = GenerativeDiscriminatorLoss()
+        self.idiscrimloss = InferenceDiscriminatorLoss()
 
-    def sample(self, x, eps):
-        zm, zs = self.encode(x)
-        z = zm + eps * zs
-        return z
-
+    # def sample(self, x, eps):
+    #     zm, zs = self.encode(x)
+    #     z = zm + eps * zs
+    #     return z
 
     def forward(self, x, eps):
 
-        dreal = self.discrim(x)
+        #inference
+        inf_d_real = self.idiscrim(eps)
+        infered_z = self.encode(x)
+        inf_d_fake = self.idiscrim(infered_z)
+        idloss = self.idiscrimloss(inf_d_real, inf_d_fake)
 
-        zm, zs = self.encode(x)
-        z = zm + eps * zs
-        xr = self.decode(z)
-        
-        mse = ((xr - x) ** 2).view(x.shape[0], self.K).mean(1)[:, None]
+        #generative process
+        gen_d_real = self.gdiscrim(x)
+        generated_x = self.decode(infered_z)
+        gen_d_fake = self.gdiscrim(generated_x)
+        gdloss = self.gdiscrimloss(gen_d_real, gen_d_fake)
 
-        abs = (torch.abs(xr - x)).view(x.shape[0], self.K).mean(1)[:, None]
-
-        dfake = self.discrim(xr)
-
-        kld = (
-            -0.5 * (1 + 2 * torch.log(zs) - zm ** 2 - zs ** 2).sum(1)[:, None] / self.K
-        )
-
-        return kld, abs, dreal, dfake, mse
+        return idloss, gdloss
 
