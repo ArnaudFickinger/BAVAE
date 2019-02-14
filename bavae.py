@@ -159,7 +159,7 @@ class Decoder(nn.Module):
 
 class BAVAE(nn.Module):
     def __init__(
-        self, img_size=128, nf=32, zdim=256, steps=5, colors=3, act="elu", vy=1e-3, gamma = 0
+        self, img_size=128, nf=32,  zdim=256, steps=5, colors=3, act="elu", vy=1e-3, gamma = 0
     ):
 
         super(BAVAE, self).__init__()
