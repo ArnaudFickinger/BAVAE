@@ -173,25 +173,12 @@ class BAVAE(nn.Module):
         self.zdim = zdim
         ks = 3
 
-        # define variance
-        self.vy = nn.Parameter(torch.Tensor([vy]), requires_grad=False)
-
-        # dense layers
-        self.dense_zm = nn.Linear(self.size_flat, zdim)
-        self.dense_zs = nn.Linear(self.size_flat, zdim)
-        self.dense_dec = nn.Linear(zdim, self.size_flat)
-
         self.encode = Encoder()
         self.decode = Decoder()
         self.gdiscrim =  GenerativeDiscriminator()
         self.idiscrim = InferenceDiscriminator()
         self.gdiscrimloss = GenerativeDiscriminatorLoss()
         self.idiscrimloss = InferenceDiscriminatorLoss()
-
-    # def sample(self, x, eps):
-    #     zm, zs = self.encode(x)
-    #     z = zm + eps * zs
-    #     return z
 
     def forward(self, x, eps):
 
